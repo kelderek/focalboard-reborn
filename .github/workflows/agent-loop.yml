@@ -126,6 +126,12 @@ jobs:
         run: |
           chmod +x scripts/04_agent_loop.sh
           ./scripts/04_agent_loop.sh
+          
+          # Auto-merge any PR the agent just opened for this issue
+          PR=$(gh pr list --repo ${{ github.repository }} \
+            --json number,headRefName \
+            --jq "[.[] | select(.headRefName | startswith(\"fix/issue-${{ matrix.fork_issue_number }}\") or startswith(\"feat/issue-${{ matrix.fork_issue_number }}\"))] | .[0].number // empty")
+          [ -n "$PR" ] && gh pr merge "$PR" --auto --squash || true
 
       - name: Upload updated backlog
         if: always()
