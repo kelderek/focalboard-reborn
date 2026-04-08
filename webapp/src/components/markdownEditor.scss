@@ -11,10 +11,12 @@
 .MarkdownEditor {
     cursor: text;
 
+    .MarkdownEditorInput,
     .MarkdownEditorInput * {
         user-select: text;
     }
 
+    .octo-editor-preview,
     .octo-editor-preview * {
         user-select: text;
     }
