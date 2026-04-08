@@ -1,0 +1,245 @@
+name: Agent loop — auto-resolve issues
+
+on:
+  schedule:
+    - cron: '0 2 * * *'      # 2am UTC nightly
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: 'Number of issues to attempt'
+        default: '3'
+        type: string
+      issue_number:
+        description: 'Specific fork issue number (optional)'
+        default: ''
+        type: string
+      dry_run:
+        description: 'Dry run — triage only, no code changes'
+        default: false
+        type: boolean
+
+concurrency:
+  group: agent-loop
+  cancel-in-progress: false    # never cancel a running loop mid-fix
+
+jobs:
+  # ── Pick and validate the batch ──────────────────────────────────────────────
+  plan:
+    name: Plan batch
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      count:   ${{ steps.pick.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download backlog artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backlog
+          path: data/
+        continue-on-error: true    # first run won't have it yet
+
+      - name: Pick next issues
+        id: pick
+        env:
+          BATCH: ${{ inputs.batch_size || '3' }}
+          ISSUE_NUMBER: ${{ inputs.issue_number || '' }}
+        run: |
+          if [ ! -f data/backlog.json ]; then
+            echo "No backlog found — nothing to do"
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -n "$ISSUE_NUMBER" ]; then
+            ITEMS=$(jq -c --argjson n "$ISSUE_NUMBER" \
+              '[.[] | select(.fork_issue_number == $n) | {idx: (. | path | .[0]), fork_issue_number, title: .title}]' \
+              data/backlog.json)
+          else
+            ITEMS=$(jq -c \
+              '[to_entries[] | select(
+                  .value.triage.auto_attempt == true and
+                  .value.status == "open" and
+                  .value.attempts < 3
+                ) | {idx: .key, fork_issue_number: .value.fork_issue_number, title: .value.title}
+              ] | .[:'"$BATCH"']' \
+              data/backlog.json)
+          fi
+
+          COUNT=$(echo "$ITEMS" | jq length)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "matrix={\"include\":$(echo "$ITEMS")}" >> "$GITHUB_OUTPUT"
+          echo "Planned $COUNT issues"
+
+  # ── Run Claude Code on each issue in parallel ─────────────────────────────
+  fix:
+    name: Fix issue #${{ matrix.fork_issue_number }}
+    needs: plan
+    if: needs.plan.outputs.count > 0 && !inputs.dry_run
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+      fail-fast: false    # one issue failing shouldn't stop others
+      max-parallel: 3     # keep API costs sane
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}    # PAT needed to push branches + open PRs
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: webapp/package-lock.json
+
+      - name: Install webapp deps
+        run: cd webapp && npm ci --prefer-offline
+
+      - name: Download backlog
+        uses: actions/download-artifact@v4
+        with:
+          name: backlog
+          path: data/
+
+      - name: Configure git
+        run: |
+          git config user.name  "focalboard-bot"
+          git config user.email "bot@users.noreply.github.com"
+
+      - name: Run agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FORK: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ matrix.fork_issue_number }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          chmod +x scripts/04_agent_loop.sh
+          ./scripts/04_agent_loop.sh
+
+      - name: Upload updated backlog
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backlog-${{ matrix.fork_issue_number }}
+          path: data/backlog.json
+          retention-days: 90
+
+  # ── Merge backlog shards and upload canonical version ─────────────────────
+  merge-backlog:
+    name: Merge backlog shards
+    needs: fix
+    if: always() && needs.plan.outputs.count > 0
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all backlog shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: backlog-*
+          path: data/shards/
+
+      - name: Merge shards
+        run: |
+          node - <<'EOF'
+          import fs from 'fs';
+          import path from 'path';
+
+          const shardsDir = 'data/shards';
+          const shards = fs.readdirSync(shardsDir, { withFileTypes: true })
+            .filter(d => d.isDirectory())
+            .map(d => {
+              const f = path.join(shardsDir, d.name, 'backlog.json');
+              return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : null;
+            })
+            .filter(Boolean);
+
+          if (shards.length === 0) process.exit(0);
+
+          // Use the first shard as base, then overlay updates from others
+          const base = shards[0];
+          for (const shard of shards.slice(1)) {
+            for (const [i, item] of shard.entries()) {
+              if (item.status !== 'open' || item.attempts > 0) {
+                base[i] = item;
+              }
+            }
+          }
+
+          fs.mkdirSync('data', { recursive: true });
+          fs.writeFileSync('data/backlog.json', JSON.stringify(base, null, 2));
+          console.log('Backlog merged from', shards.length, 'shards');
+          EOF
+
+      - name: Upload canonical backlog
+        uses: actions/upload-artifact@v4
+        with:
+          name: backlog
+          path: data/backlog.json
+          retention-days: 90
+          overwrite: true
+
+  # ── Post nightly summary to Discussions or a status issue ─────────────────
+  summary:
+    name: Post summary
+    needs: [fix, merge-backlog]
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download backlog
+        uses: actions/download-artifact@v4
+        with:
+          name: backlog
+          path: data/
+
+      - name: Post summary comment
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ ! -f data/backlog.json ]; then exit 0; fi
+
+          OPEN=$(jq '[.[] | select(.status=="open" and .triage.auto_attempt==true)] | length' data/backlog.json)
+          DONE=$(jq '[.[] | select(.status=="done")] | length' data/backlog.json)
+          FAIL=$(jq '[.[] | select(.status=="failed")] | length' data/backlog.json)
+          HUMAN=$(jq '[.[] | select(.triage.auto_attempt==false)] | length' data/backlog.json)
+
+          MSG="### 🤖 Nightly agent run — $(date '+%Y-%m-%d')
+          | Status | Count |
+          |---|---|
+          | ✅ Done | $DONE |
+          | 🔄 Open (auto) | $OPEN |
+          | ❌ Failed | $FAIL |
+          | 👤 Human review | $HUMAN |
+
+          Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Find or create the status tracking issue
+          STATUS_ISSUE=$(gh issue list \
+            --label "status-tracker" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -z "$STATUS_ISSUE" ]; then
+            STATUS_ISSUE=$(gh issue create \
+              --title "🤖 Agent loop status tracker" \
+              --body "This issue tracks nightly automated runs." \
+              --label "status-tracker" \
+              --json number \
+              --jq '.number')
+          fi
+
+          gh issue comment "$STATUS_ISSUE" --body "$MSG"
