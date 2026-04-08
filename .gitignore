@@ -74,3 +74,7 @@ server/vendor
 docker/certs
 docker/data
 server/**/*.coverage
+
+# Agent automation data — never commit
+data/
+nohup.out
