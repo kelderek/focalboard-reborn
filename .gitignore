@@ -13,9 +13,6 @@ pids
 
 # OS Files
 .DS_Store
-data/diffs/
-data/issues_raw.json
-data/prs_raw.json
 
 # VSCode project files
 .vscode
@@ -79,5 +76,7 @@ docker/data
 server/**/*.coverage
 
 # Agent automation data — never commit
-data/
+data/diffs/
+data/issues_raw.json
+data/prs_raw.json
 nohup.out
