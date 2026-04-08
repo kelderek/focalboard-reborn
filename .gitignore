@@ -13,6 +13,9 @@ pids
 
 # OS Files
 .DS_Store
+data/diffs/
+data/issues_raw.json
+data/prs_raw.json
 
 # VSCode project files
 .vscode
