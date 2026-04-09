@@ -2,8 +2,8 @@ name: Retriage failed items
 
 on:
   schedule:
-    - cron: '0 3 * * *'   # 3am UTC daily, after agent loop
-  workflow_dispatch:       # or trigger manually any time
+    - cron: '0 3 * * *'
+  workflow_dispatch:
 
 jobs:
   retriage:
@@ -20,7 +20,7 @@ jobs:
       - name: Check for items needing retriage
         id: check
         run: |
-          COUNT=$(jq '[.[] | select(.triage.skip_reason | strings | test("Triage failed|credit"))] | length' data/backlog.json)
+          COUNT=$(jq '[.[] | select(.triage.category == "unknown" and .triage.auto_attempt == false)] | length' data/backlog.json)
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
           echo "Found $COUNT items needing retriage"
 
@@ -29,11 +29,9 @@ jobs:
         run: |
           jq '
             map(
-              if (.triage.skip_reason | strings | test("Triage failed|credit"))
+              if (.triage.category == "unknown" and .triage.auto_attempt == false)
               then
-                .triage.auto_attempt = false |
                 .triage.skip_reason = "pending-retriage" |
-                .triage.category = "unknown" |
                 .status = "open" |
                 .attempts = 0
               else . end
@@ -45,15 +43,18 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          # Retriage only the unknown/pending items, not the whole backlog
-          node << 'EOF'
+          node --input-type=module << 'EOF'
           import fs from 'fs';
 
           const KEY = process.env.ANTHROPIC_API_KEY;
           const BACKLOG = 'data/backlog.json';
           const backlog = JSON.parse(fs.readFileSync(BACKLOG, 'utf8'));
 
-          const PM = {security:1,crash:2,'data-loss':2,bug:3,performance:4,feature:5,enhancement:5,documentation:6,i18n:7,chore:8};
+          const PM = {
+            security:1, crash:2, 'data-loss':2, bug:3, performance:4,
+            feature:5, enhancement:5, documentation:6, i18n:7, chore:8
+          };
+
           const SYS = [
             'You are a senior engineer triaging a GitHub backlog for Focalboard.',
             'Respond ONLY with a valid JSON object — no markdown fences, no explanation.',
@@ -61,8 +62,8 @@ jobs:
             'priority(1-8), complexity(trivial|small|medium|large|unknown),',
             'auto_attempt(bool), skip_reason(str|null), affected_area(backend|frontend|desktop|i18n|docs|ci|unknown),',
             'summary(str), test_hint(str|null).',
-            'auto_attempt=false for: security(always), large/unknown, no repro, UI decisions.',
-            'auto_attempt=true for: trivial/small bugs, i18n, docs, small clear features.',
+            'auto_attempt=false for: security(always), large/unknown complexity, no repro steps, UI decisions.',
+            'auto_attempt=true for: trivial/small bugs, i18n files, docs, small features with clear specs.',
           ].join('\n');
 
           const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -70,8 +71,17 @@ jobs:
           async function ask(content) {
             const r = await fetch('https://api.anthropic.com/v1/messages', {
               method: 'POST',
-              headers: {'Content-Type':'application/json','x-api-key':KEY,'anthropic-version':'2023-06-01'},
-              body: JSON.stringify({model:'claude-sonnet-4-6',max_tokens:500,system:SYS,messages:[{role:'user',content}]})
+              headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': KEY,
+                'anthropic-version': '2023-06-01'
+              },
+              body: JSON.stringify({
+                model: 'claude-sonnet-4-6',
+                max_tokens: 500,
+                system: SYS,
+                messages: [{ role: 'user', content }]
+              })
             });
             if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
             const d = await r.json();
@@ -85,37 +95,50 @@ jobs:
           }
 
           const toRetriage = backlog
-            .map((item, idx) => ({item, idx}))
-            .filter(({item}) => item.triage.skip_reason === 'pending-retriage');
+            .map((item, idx) => ({ item, idx }))
+            .filter(({ item }) => item.triage.skip_reason === 'pending-retriage');
 
           console.log(`Retriaging ${toRetriage.length} items...`);
 
-          for (const {item, idx} of toRetriage) {
-            process.stdout.write(`  [${idx}] #${item.number} ${item.title.substring(0,55)}...`);
-            const prompt = `${item.type.toUpperCase()} #${item.number}\nTitle: ${item.title}\nLabels: ${(item.labels||[]).join(',')||'none'}\nBody:\n${(item.body||'No description.').substring(0,2000)}`;
-            let triage; let attempts = 0;
+          for (const { item, idx } of toRetriage) {
+            process.stdout.write(`  [${idx}] #${item.number} ${item.title.substring(0, 55)}...`);
+            const prompt = [
+              `${item.type.toUpperCase()} #${item.number}`,
+              `Title: ${item.title}`,
+              `Labels: ${(item.labels || []).join(', ') || 'none'}`,
+              `Body:\n${(item.body || 'No description.').substring(0, 2000)}`
+            ].join('\n');
+
+            let triage = null;
+            let attempts = 0;
             while (attempts < 3) {
-              try { triage = await ask(prompt); break; }
-              catch(e) {
+              try {
+                triage = await ask(prompt);
+                break;
+              } catch (e) {
                 attempts++;
                 if (attempts === 3) {
-                  console.log(` FAILED: ${e.message}`);
-                  triage = null;
+                  process.stdout.write(` FAILED: ${e.message}\n`);
                 } else {
                   await sleep(3000 * attempts);
                 }
               }
             }
+
             if (triage) {
               triage.priority = Math.min(triage.priority, PM[triage.category] ?? 9);
               backlog[idx].triage = triage;
               process.stdout.write(` ✓ [${triage.category}/${triage.complexity}] auto=${triage.auto_attempt}\n`);
             }
+
             await sleep(400);
           }
 
           fs.writeFileSync(BACKLOG, JSON.stringify(backlog, null, 2));
-          console.log('Done.');
+
+          const done = backlog.filter(i => i.triage.category !== 'unknown').length;
+          const still = backlog.filter(i => i.triage.category === 'unknown').length;
+          console.log(`Done. ${done} triaged, ${still} still unknown.`);
           EOF
 
       - name: Commit updated backlog
@@ -124,5 +147,5 @@ jobs:
           git config user.name  "focalboard-bot"
           git config user.email "bot@users.noreply.github.com"
           git add data/backlog.json
-          git diff --cached --quiet || git commit -m "chore: retriage $(date '+%Y-%m-%d') [skip ci]"
+          git diff --cached --quiet || git commit -m "chore: retriage unknown items $(date '+%Y-%m-%d') [skip ci]"
           git push origin main || true
