@@ -281,7 +281,11 @@
     "assigned_to": null,
     "fork_issue_number": null,
     "attempts": 1,
+<<<<<<< Updated upstream
     "last_attempt": "2026-04-09T03:49:55Z"
+=======
+    "last_attempt": "2026-04-09T03:54:47Z"
+>>>>>>> Stashed changes
   },
   {
     "body": "## Steps to reproduce the behavior\r\n\r\n# github.com/mattermost/mattermost-server/v6/shared/mlog\r\ngo/pkg/mod/github.com/mattermost/mattermost-server/v6@v6.7.2/shared/mlog/mlog.go:87:11: cannot use generic function logr.Int without instantiation\r\ngo/pkg/mod/github.com/mattermost/mattermost-server/v6@v6.7.2/shared/mlog/mlog.go:96:12: cannot use generic function logr.Uint without instantiation\r\ngo/pkg/mod/github.com/mattermost/mattermost-server/v6@v6.7.2/shared/mlog/mlog.go:105:14: cannot use generic function logr.String without instantiation\r\ngo/pkg/mod/github.com/mattermost/mattermost-server/v6@v6.7.2/shared/mlog/mlog.go:130:12: cannot use generic function logr.Bool without instantiation\r\ngo/pkg/mod/github.com/mattermost/mattermost-server/v6@v6.7.2/shared/mlog/mlog.go:143:13: cannot use generic function logr.Array without instantiation\r\ngo/pkg/mod/github.com/mattermost/mattermost-server/v6@v6.7.2/shared/mlog/mlog.go:146:11: cannot use generic function logr.Map without instantiation\r\n\r\n## Edition and Platform\r\n\r\n - Edition: Personal Desktop\r\n\r\nAdd any other context about the problem here, and any notes about the severity:\r\n* Sev 1: Affects critical functionality without a workaround\r\n",
