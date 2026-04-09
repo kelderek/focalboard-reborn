@@ -193,7 +193,7 @@ run_issue() {
     git commit -m "$commit_msg" --quiet || { log "Nothing to commit"; set_status "$idx" "open"; return 0; }
 
     # Push
-    git push origin "$branch_name" --quiet --force-with-lease
+    git push origin "$branch_name" --quiet --force
 
     # Open PR
     PR_BODY="Closes #${fork_issue}
